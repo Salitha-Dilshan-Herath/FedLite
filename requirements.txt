@@ -1,0 +1,9 @@
+Django>=4.2,<5.0
+numpy
+pandas
+matplotlib
+flwr[simulation]
+torch
+torchvision
+ray
+certifi

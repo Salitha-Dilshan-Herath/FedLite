@@ -1,0 +1,273 @@
+{% extends "dashboard/base.html" %}
+{% block content %}
+
+<header class="header">
+  <h1>Federated Learning Dashboard</h1>
+  <p>Compare FedAvg, FedProx, FedAdam baselines with communication-efficient Top-K + Quantization strategy.</p>
+</header>
+
+<div class="grid">
+  <aside class="card">
+    <h3>Experiment Configuration</h3>
+
+    <form method="post" onsubmit="event.preventDefault(); startJob(this);" id="experimentForm">
+      {% csrf_token %}
+
+      <div class="form-section">
+        <div class="form-section-title">Federated Learning</div>
+        <div class="form-group">
+          <label for="id_dataset">Dataset</label>
+          {{ form.dataset }}
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="id_rounds">Rounds</label>
+            {{ form.rounds }}
+          </div>
+          <div class="form-group">
+            <label for="id_num_clients">Clients</label>
+            {{ form.num_clients }}
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="id_fraction_fit">Fraction Fit</label>
+            {{ form.fraction_fit }}
+          </div>
+          <div class="form-group">
+            <label for="id_alpha">Alpha (Dirichlet)</label>
+            {{ form.alpha }}
+          </div>
+        </div>
+      </div>
+
+      <div class="form-section">
+        <div class="form-section-title">Compression Strategy</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="id_topk_percent">Top-K %</label>
+            {{ form.topk_percent }}
+          </div>
+          <div class="form-group">
+            <label for="id_quant_bits">Quantization</label>
+            {{ form.quant_bits }}
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="id_local_epochs">Local Epochs</label>
+          {{ form.local_epochs }}
+        </div>
+        <div class="checkbox-group">
+          {{ form.error_feedback }}
+          <label for="id_error_feedback">Error Feedback</label>
+        </div>
+      </div>
+
+      <button class="btn" type="submit">
+        <span>Run Experiment</span>
+      </button>
+    </form>
+
+    <p class="tip">Runs 5 experiments: FedAvg (E=1), FedAvg (E=2), FedProx, FedAdam, TopK+Quant. Keep rounds ≤ 30 for a quick demo.</p>
+
+    <div class="progress-section">
+      <div class="progress-section-title">Experiment Progress</div>
+      <div id="progressContainer"></div>
+      <p id="statusText" class="status-text">Idle</p>
+    </div>
+  </aside>
+
+  <main>
+    <div id="results" style="display:none;">
+      <div class="card">
+        <h3>Results Summary</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Experiment</th>
+                <th>Final Accuracy</th>
+                <th>Cumulative Upload (MB)</th>
+                <th>Avg Upload/Round (MB)</th>
+              </tr>
+            </thead>
+            <tbody id="summaryBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card plot-card" style="margin-top:24px;">
+        <h3>Accuracy vs Round</h3>
+        <img id="accImg" alt="Accuracy plot" loading="lazy" />
+      </div>
+
+      <div class="card plot-card" style="margin-top:24px;">
+        <h3>Upload per Round (MB)</h3>
+        <img id="upImg" alt="Upload per round plot" loading="lazy" />
+      </div>
+
+      <div class="card plot-card" style="margin-top:24px;">
+        <h3>Cumulative Upload (MB)</h3>
+        <img id="cumImg" alt="Cumulative upload plot" loading="lazy" />
+      </div>
+    </div>
+
+    <div id="placeholder" class="card">
+      <div class="placeholder">
+        <p>Configure settings and click <strong>Run Experiment</strong> to compare FedAvg, FedProx, FedAdam and the TopK+Quant strategy.</p>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const EXPERIMENT_NAMES = ["FedAvg (E=1)", "FedAvg (E=2)", "FedProx", "FedAdam", "TopK+Quant"];
+
+function csrfTokenFromForm(form) {
+  const el = form.querySelector('input[name="csrfmiddlewaretoken"]');
+  return el ? el.value : "";
+}
+
+function fmt(x, d = 4) {
+  if (x === null || x === undefined || x === "") return "—";
+  const n = Number(x);
+  if (Number.isNaN(n)) return "—";
+  return n.toFixed(d);
+}
+
+function setStatus(cls, text) {
+  const el = document.getElementById("statusText");
+  el.className = "status-text " + cls;
+  el.innerText = text;
+}
+
+function initProgressBars(totalRounds) {
+  const container = document.getElementById("progressContainer");
+  container.innerHTML = EXPERIMENT_NAMES.map((name, i) => `
+    <div id="progressItem${i}" class="progress-item">
+      <div class="progress-item-header">
+        <span class="progress-item-label">${name}</span>
+        <span id="round${i}" class="progress-item-round">0/${totalRounds}</span>
+      </div>
+      <div class="progress-track">
+        <div id="bar${i}" class="progress-bar"></div>
+      </div>
+    </div>
+  `).join("");
+}
+
+function updateProgressBars(experiments, total, phase) {
+  const phaseIdx = phase.startsWith("exp_") ? parseInt(phase.split("_")[1], 10) : -1;
+  experiments.forEach((exp, i) => {
+    const roundEl = document.getElementById(`round${i}`);
+    const barEl = document.getElementById(`bar${i}`);
+    const itemEl = document.getElementById(`progressItem${i}`);
+    if (!roundEl || !barEl || !itemEl) return;
+
+    const r = exp.round ?? 0;
+    const pct = total > 0 ? Math.min(100, Math.round((r / total) * 100)) : 0;
+
+    roundEl.textContent = `${r}/${total}`;
+    barEl.style.width = pct + "%";
+
+    itemEl.className = "progress-item" +
+      (i === phaseIdx ? " active" : r >= total ? " completed" : "");
+  });
+}
+
+function resetProgress(totalRounds) {
+  initProgressBars(totalRounds);
+}
+
+async function startJob(form) {
+  const rounds = parseInt(form.rounds.value) || 30;
+  resetProgress(rounds);
+  setStatus("running", "Starting...");
+  document.getElementById("results").style.display = "none";
+  document.getElementById("placeholder").style.display = "block";
+  document.getElementById("summaryBody").innerHTML = "";
+
+  const formData = new FormData(form);
+
+  const res = await fetch("/start/", {
+    method: "POST",
+    body: formData,
+    headers: { "X-CSRFToken": csrfTokenFromForm(form) }
+  });
+
+  if (!res.ok) {
+    setStatus("error", "Failed to start job");
+    return;
+  }
+
+  const data = await res.json();
+  poll(data.job_id);
+}
+
+async function poll(jobId) {
+  const res = await fetch(`/progress/${jobId}/`);
+  if (!res.ok) {
+    setStatus("error", "Progress endpoint failed");
+    return;
+  }
+
+  const data = await res.json();
+
+  const total = data.total_rounds || 1;
+  const experiments = data.experiments || EXPERIMENT_NAMES.map(n => ({ name: n, round: 0 }));
+  const phase = data.phase || "idle";
+
+  updateProgressBars(experiments, total, phase);
+
+  const phaseIdx = phase.startsWith("exp_") ? parseInt(phase.split("_")[1], 10) : -1;
+  const curExp = phaseIdx >= 0 && phaseIdx < experiments.length ? experiments[phaseIdx] : null;
+  const curRound = curExp ? curExp.round : 0;
+
+  setStatus("running", curExp
+    ? `Running ${curExp.name} — Round ${curRound}/${total}`
+    : data.message || "");
+
+  if (data.status === "DONE") {
+    experiments.forEach((_, i) => {
+      const itemEl = document.getElementById(`progressItem${i}`);
+      const barEl = document.getElementById(`bar${i}`);
+      if (itemEl) itemEl.className = "progress-item completed";
+      if (barEl) barEl.style.width = "100%";
+    });
+
+    const r = data.result || {};
+    const exps = r.experiments || [];
+
+    document.getElementById("placeholder").style.display = "none";
+    document.getElementById("results").style.display = "block";
+
+    document.getElementById("summaryBody").innerHTML = exps.map(e => `
+      <tr>
+        <td>${e.name}</td>
+        <td><span class="metric">${fmt(e.final_acc, 4)}</span></td>
+        <td>${fmt(e.upload_mb, 3)}</td>
+        <td>${fmt(e.avg_upload_mb, 3)}</td>
+      </tr>
+    `).join("");
+
+    if (r.acc_img) document.getElementById("accImg").src = "data:image/png;base64," + r.acc_img;
+    if (r.up_img) document.getElementById("upImg").src = "data:image/png;base64," + r.up_img;
+    if (r.cum_img) document.getElementById("cumImg").src = "data:image/png;base64," + r.cum_img;
+
+    const lastExp = exps[exps.length - 1];
+    setStatus("done", lastExp ? `Complete — ${lastExp.name}: ${fmt(lastExp.final_acc, 4)} acc` : "Complete");
+    return;
+  }
+
+  if (data.status === "ERROR") {
+    setStatus("error", data.error || "Unknown error");
+    return;
+  }
+
+  setTimeout(() => poll(jobId), 1500);
+}
+
+document.addEventListener("DOMContentLoaded", () => initProgressBars(30));
+</script>
+
+{% endblock %}
